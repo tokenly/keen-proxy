@@ -12,8 +12,13 @@ MAX_RETRIES     = process.env.MAX_RETRIES     or 30
 MAX_QUEUE_SIZE  = process.env.MAX_QUEUE_SIZE  or 5
 CLIENT_TIMEOUT  = process.env.CLIENT_TIMEOUT  or 10000  # <-- clients must respond in this amount of time
 
-KEEN_PROJECT_ID = process.env.KEEN_PROJECT_ID     or false
+KEEN_PROJECT_ID = process.env.KEEN_PROJECT_ID  or false
 KEEN_API_KEY    = process.env.KEEN_API_KEY     or false
+
+SLACK_WEB_API_TOKEN = process.env.SLACK_WEB_API_TOKEN or false
+SLACK_USERNAME      = process.env.SLACK_USERNAME      or 'Swapbot'
+SLACK_CHANNEL       = process.env.SLACK_CHANNEL       or ''
+SLACK_ICON_URL      = process.env.SLACK_ICON_URL      or 'https://tokenrank.tokenly.com/images/blank-robot-fade.png'
 
 if not KEEN_PROJECT_ID
     console.error "You must supply a KEEN_PROJECT_ID environment variable"
@@ -22,6 +27,7 @@ if not KEEN_PROJECT_ID
 if not KEEN_API_KEY
     console.error "You must supply a KEEN_API_KEY environment variable"
     process.exit 1
+
 
 
 http        = require('http')
@@ -54,7 +60,16 @@ reserveJob = ()->
             # watch for another job
             reserveJob()
 
-            processJob job, (result)->
+            jobData = JSON.parse(job.data)
+
+            if jobData.meta.jobType == 'slack'
+                jobHandler = processSlackJob
+
+            else
+                jobHandler = processKeenStatsJob
+            
+
+            jobHandler jobData, job, (result)->
                 --jobCount
                 if DEBUG then console.log "[#{new Date().toString()}] deleting job #{job.id}"
                 beanstalkReadClient.deleteJob(job.id).onSuccess (del_msg)->
@@ -70,26 +85,67 @@ reserveJob = ()->
     return
 
 
-processJob = (job, callback)->
-    jobData = JSON.parse(job.data)
+processKeenStatsJob = (jobData, job, callback)->
+    if not KEEN_API_KEY
+        finishJob(true, 'No KEEN_API_KEY defined', jobData, job, callback)
+        return
 
+    href = "https://api.keen.io/3.0/projects/#{KEEN_PROJECT_ID}/events/#{jobData.meta.collection}?api_key=#{KEEN_API_KEY}"
+    requestData = JSON.stringify(jobData.data)
+    processRestlerJob(jobData, job, href, true, requestData, callback)
+
+processSlackJob = (jobData, job, callback)->
+    if not SLACK_WEB_API_TOKEN
+        finishJob(true, 'No SLACK_WEB_API_TOKEN defined', jobData, job, callback)
+        return
+
+    attachment = jobData.data
+    if not attachment.color then attachment.color = "good"
+
+    href = "https://slack.com/api/chat.postMessage"
+    slackRequestData = {
+        token: SLACK_WEB_API_TOKEN
+        username: SLACK_USERNAME
+        channel: SLACK_CHANNEL
+        icon_url: SLACK_ICON_URL
+        text: ''
+    }
+    slackRequestData.attachments = JSON.stringify([attachment])
+
+    # console.log "slackRequestData=",slackRequestData
+
+    requestData = slackRequestData
+    processRestlerJob(jobData, job, href, false, requestData, callback)
+
+processRestlerJob = (jobData, job, href, isPost, requestData, callback)->
     success = false
 
     # call the callback
     if not jobData.meta?.attempt?
         jobData.meta.attempt = 0
     jobData.meta.attempt = jobData.meta.attempt + 1
-    href = "https://api.keen.io/3.0/projects/#{KEEN_PROJECT_ID}/events/#{jobData.meta.collection}?api_key=#{KEEN_API_KEY}";
 
+    # console.log("requestData: ",requestData)
 
     try
+        if DEBUG then console.log "[#{new Date().toString()}] begin processKeenStatsJob "+job.id+" (attempt #{jobData.meta.attempt} of #{MAX_RETRIES}, href #{href})"
 
-        if DEBUG then console.log "[#{new Date().toString()}] begin processJob "+job.id+" (attempt #{jobData.meta.attempt} of #{MAX_RETRIES}, href #{href})"
-        rest.post(href, {
-            headers: {'User-Agent': 'Tokenly Keen Proxy', 'Content-Type': 'application/json'}
+        callParams = {
+            headers: {'User-Agent': 'Tokenly Event Proxy'}
             timeout: CLIENT_TIMEOUT
-            data: JSON.stringify(jobData.data)
-        }).on 'complete', (data, response)->
+        }
+
+        if isPost
+            callParams.headers['Content-Type'] = 'application/json'
+            callFn = rest.post
+            callParams.data = requestData
+        else
+            callFn = rest.get
+            callParams.query = requestData
+
+        callFn(href, callParams).on 'complete', (data, response)->
+            console.log "data",data
+            # console.log "response",response
             msg = ''
             if response
                 if DEBUG then console.log "[#{new Date().toString()}] received HTTP response: "+response?.statusCode?.toString()
@@ -125,7 +181,10 @@ processJob = (job, callback)->
             return
 
     catch err
-         if DEBUG then console.log "[#{new Date().toString()}] Caught ERROR:",err
+         if DEBUG
+            console.log "[#{new Date().toString()}] Caught ERROR:",err
+            console.log(err.stack);
+
          finishJob(false, "Unexpected error: "+err, jobData, job, callback)
          return
 
